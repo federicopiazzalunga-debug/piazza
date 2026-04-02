@@ -232,117 +232,322 @@
 
 ;;; ------------------------------------------------------------
 ;;; Funzione: analizza-fori-solido
-;;;   Analizza le sotto-entità di un solido 3D per trovare i
-;;;   fori cilindrici.
+;;;   Identifica i fori cilindrici in un solido 3D usando la
+;;;   tecnica di esplosione temporanea, necessaria perché i fori
+;;;   già sottratti tramite operazioni booleane (SUBTRACT) non
+;;;   esistono più come sotto-entità separate ma sono fusi nella
+;;;   geometria ACIS del solido.
+;;;
+;;;   Procedura:
+;;;   1. Copia il solido (vla-Copy) per non modificare l'originale
+;;;   2. Esplode iterativamente la copia (vla-Explode) fino ad
+;;;      ottenere le curve primitive: solido → facce REGION →
+;;;      curve (CIRCLE, ARC, LINE, ELLIPSE)
+;;;   3. Filtra i CIRCLE tra le entità risultanti
+;;;   4. Raggruppa i cerchi coassiali con lo stesso raggio per
+;;;      identificare i fori unici:
+;;;      - Foro passante: due cerchi coassiali (profondità reale
+;;;        = distanza tra i centri)
+;;;      - Foro cieco: un solo cerchio (profondità stimata dalla
+;;;        dimensione del solido)
+;;;   5. Cancella TUTTE le entità temporanee (anche in caso di
+;;;      errore tramite gestore *error*)
+;;;
 ;;;   Restituisce una lista di fori, ognuno nella forma:
 ;;;   (faccia pos-x pos-y diametro profondita)
 ;;; ------------------------------------------------------------
 (defun analizza-fori-solido (nome-entita bbox-info
-                              / entita-dati tipo-entita
-                                ultima-entita sotto-entita
-                                dati-sottoentita
-                                lista-fori lista-cerchi
-                                cx cy cz raggio diametro
-                                nome-faccia pos-xy profondita
-                                x-min y-min z-min
-                                x-max y-max z-max
-                                lun lar alt)
+                              / oggetto-vla oggetto-copia entita-copia
+                                coda-esplosione nuova-coda
+                                lista-cerchi-info lista-fori
+                                lun lar alt
+                                x-min y-min z-min x-max y-max z-max
+                                ent-corrente tipo-ent vla-ent
+                                risultato-exp nuovo-ent
+                                dati-c cx cy cz raggio normale-c
+                                idx1 idx2 cerchi-usati
+                                cx1 cy1 cz1 r1 nx1 ny1 nz1
+                                cx2 cy2 cz2 r2 nx2 ny2 nz2
+                                lunghezza-n dot-nn vx vy vz dist-cc
+                                vx-n vy-n vz-n dot-vn
+                                cerchio-gemello profondita-foro
+                                nome-faccia pos-xy
+                                livello-corrente)
 
-  (setq lun    (nth 0 bbox-info)
-        lar    (nth 1 bbox-info)
-        alt    (nth 2 bbox-info)
-        x-min  (nth 3 bbox-info)
-        y-min  (nth 4 bbox-info)
-        z-min  (nth 5 bbox-info)
-        x-max  (nth 6 bbox-info)
-        y-max  (nth 7 bbox-info)
-        z-max  (nth 8 bbox-info))
+  ; Inizializza le dimensioni del bounding box
+  (setq lun   (nth 0 bbox-info)
+        lar   (nth 1 bbox-info)
+        alt   (nth 2 bbox-info)
+        x-min (nth 3 bbox-info)
+        y-min (nth 4 bbox-info)
+        z-min (nth 5 bbox-info)
+        x-max (nth 6 bbox-info)
+        y-max (nth 7 bbox-info)
+        z-max (nth 8 bbox-info))
 
-  (setq lista-fori   '()
-        lista-cerchi '())
+  (setq lista-fori              '()
+        lista-cerchi-info       '()
+        *ANALISI-FORI-ENTI-TEMP* '())
 
-  ; Scansiona le sotto-entità del solido cercando cerchi (fori).
-  ; Le sotto-entità di un 3DSOLID con ACIS includono le facce,
-  ; i bordi e i vertici. I fori cilindrici appaiono come bordi
-  ; circolari (cerchi) sulle facce.
-  ; Si usa entnext in modo corretto: ogni iterazione riceve
-  ; l'ultima entità processata per ottenere la successiva.
-  (setq ultima-entita nome-entita)
-  (while (setq sotto-entita (entnext ultima-entita))
-    ; Verifica se la sotto-entità è un cerchio
-    (setq dati-sottoentita (entget sotto-entita))
-    (setq tipo-entita (cdr (assoc 0 dati-sottoentita)))
-
-    (if (wcmatch tipo-entita "CIRCLE,ARC")
-      (setq lista-cerchi (append lista-cerchi (list sotto-entita)))
+  ; Installa il gestore errori per garantire la pulizia delle
+  ; entità temporanee anche in caso di errore imprevisto.
+  ; Le entità temporanee sono salvate nella variabile globale
+  ; *ANALISI-FORI-ENTI-TEMP* accessibile dall'handler.
+  (setq *ANALISI-FORI-ERR-ORIG* *error*)
+  (defun *error* (msg)
+    (foreach ent *ANALISI-FORI-ENTI-TEMP*
+      (if (and ent (not (null (entget ent))))
+        (entdel ent)
+      )
     )
-
-    ; Avanza alla sotto-entità successiva
-    (setq ultima-entita sotto-entita)
+    (setq *ANALISI-FORI-ENTI-TEMP* '())
+    (setq *error* *ANALISI-FORI-ERR-ORIG*)
+    (if (not (wcmatch (strcase msg) "*BREAK*,*CANCEL*,*EXIT*"))
+      (princ (strcat "\nErrore nell'analisi dei fori: " msg))
+    )
   )
 
-  ; Per ogni cerchio trovato, crea un record foro
-  (foreach ent-cerchio lista-cerchi
-    (setq dati-sottoentita (entget ent-cerchio))
-    (setq tipo-entita (cdr (assoc 0 dati-sottoentita)))
+  ; --- Fase 1: Copia il solido per non modificare l'originale ---
+  (setq oggetto-vla   (vlax-ename->vla-object nome-entita))
+  (setq oggetto-copia (vla-Copy oggetto-vla))
+  (setq entita-copia  (vlax-vla-object->ename oggetto-copia))
+  (setq *ANALISI-FORI-ENTI-TEMP* (list entita-copia))
 
-    (if (equal tipo-entita "CIRCLE")
+  ; --- Fase 2: Esplosione iterativa per estrarre le curve primitive ---
+  ; Strategia a livelli: ogni iterazione del while processa un
+  ; livello di esplosione. Le entità non esplodibili (curve
+  ; primitive) rimangono in *ANALISI-FORI-ENTI-TEMP* per essere
+  ; analizzate nella fase successiva.
+  ; Il solido si decompone in: 3DSOLID → REGION (facce) → curve
+  (setq coda-esplosione (list entita-copia)
+        livello-corrente 0)
+
+  (while (and coda-esplosione (< livello-corrente 5)) ; max 5 livelli: 3DSOLID→REGION→curve (5 è abbondante)
+    (setq nuova-coda '())
+
+    (foreach ent-corrente coda-esplosione
+      (if (and ent-corrente (entget ent-corrente))
+        (progn
+          (setq tipo-ent (cdr (assoc 0 (entget ent-corrente))))
+
+          ; Solo le entità composte vengono esplose ulteriormente;
+          ; le curve primitive restano invariate in *ANALISI-FORI-ENTI-TEMP*
+          (if (wcmatch tipo-ent "3DSOLID,REGION,SURFACE,BODY")
+            (progn
+              (setq vla-ent (vlax-ename->vla-object ent-corrente))
+              (if vla-ent
+                (progn
+                  ; Tentativo di esplosione con cattura degli errori
+                  (setq risultato-exp
+                        (vl-catch-all-apply 'vla-Explode (list vla-ent)))
+                  ; vla-Explode NON cancella l'originale:
+                  ; ent-corrente è già in *ANALISI-FORI-ENTI-TEMP*
+                  (if (not (vl-catch-all-error-p risultato-exp))
+                    ; Esplosione riuscita: aggiungi le nuove entità
+                    ; alla coda per il prossimo livello di esplosione
+                    (if risultato-exp
+                      (vlax-for nuovo-obj risultato-exp
+                        (setq nuovo-ent (vlax-vla-object->ename nuovo-obj))
+                        (if nuovo-ent
+                          (progn
+                            (setq nuova-coda
+                                  (append nuova-coda (list nuovo-ent)))
+                            (setq *ANALISI-FORI-ENTI-TEMP*
+                                  (append *ANALISI-FORI-ENTI-TEMP*
+                                          (list nuovo-ent)))
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+
+    (setq coda-esplosione nuova-coda
+          livello-corrente (1+ livello-corrente))
+  )
+
+  ; --- Fase 3: Raccoglie i cerchi tra tutte le entità temporanee ---
+  ; I cerchi rappresentano i bordi circolari dei fori nel solido
+  (foreach ent *ANALISI-FORI-ENTI-TEMP*
+    (if (and ent (entget ent))
       (progn
-        ; Centro del cerchio
-        (setq cx (car   (cdr (assoc 10 dati-sottoentita)))
-              cy (cadr  (cdr (assoc 10 dati-sottoentita)))
-              cz (caddr (cdr (assoc 10 dati-sottoentita))))
-        ; Raggio e diametro
-        (setq raggio   (cdr (assoc 40 dati-sottoentita))
-              diametro (* 2.0 raggio))
+        (setq tipo-ent (cdr (assoc 0 (entget ent))))
+        (if (equal tipo-ent "CIRCLE")
+          (progn
+            (setq dati-c   (entget ent)
+                  cx       (car   (cdr (assoc 10 dati-c)))
+                  cy       (cadr  (cdr (assoc 10 dati-c)))
+                  cz       (caddr (cdr (assoc 10 dati-c)))
+                  raggio   (cdr (assoc 40 dati-c))
+                  normale-c (cdr (assoc 210 dati-c)))
+            (if (null normale-c)
+              (setq normale-c '(0.0 0.0 1.0))
+            )
+            ; Salva: (cx cy cz raggio nx ny nz)
+            (setq lista-cerchi-info
+                  (append lista-cerchi-info
+                          (list (list cx cy cz raggio
+                                      (car normale-c)
+                                      (cadr normale-c)
+                                      (caddr normale-c)))))
+          )
+        )
+      )
+    )
+  )
 
-        ; Vettore normale del piano del cerchio (gruppo 210)
-        (setq normale-cerchio (cdr (assoc 210 dati-sottoentita)))
-        (if (null normale-cerchio)
-          (setq normale-cerchio '(0.0 0.0 1.0))
+  ; --- Fase 4: Raggruppa i cerchi per identificare i fori ---
+  ; Un foro è identificato da cerchi coassiali con lo stesso raggio:
+  ; - Foro passante: due cerchi alle due estremità (profondità reale)
+  ; - Foro cieco:    un solo cerchio sulla faccia di ingresso
+  (setq cerchi-usati '()
+        idx1          0)
+
+  (foreach cerchio1 lista-cerchi-info
+    (if (not (member idx1 cerchi-usati))
+      (progn
+        (setq cx1 (nth 0 cerchio1)
+              cy1 (nth 1 cerchio1)
+              cz1 (nth 2 cerchio1)
+              r1  (nth 3 cerchio1)
+              nx1 (nth 4 cerchio1)
+              ny1 (nth 5 cerchio1)
+              nz1 (nth 6 cerchio1))
+
+        ; Normalizza il vettore normale del cerchio 1
+        (setq lunghezza-n (sqrt (+ (* nx1 nx1) (* ny1 ny1) (* nz1 nz1))))
+        (if (> lunghezza-n *TOLLERANZA*)
+          (setq nx1 (/ nx1 lunghezza-n)
+                ny1 (/ ny1 lunghezza-n)
+                nz1 (/ nz1 lunghezza-n))
         )
 
-        ; Identifica la faccia su cui si trova il foro
+        ; Cerca un cerchio gemello (altra estremità dello stesso foro)
+        (setq cerchio-gemello nil
+              profondita-foro 0.0
+              idx2            0)
+
+        (foreach cerchio2 lista-cerchi-info
+          (if (and (not (= idx1 idx2))
+                   (not (member idx2 cerchi-usati))
+                   (null cerchio-gemello))
+            (progn
+              (setq cx2 (nth 0 cerchio2)
+                    cy2 (nth 1 cerchio2)
+                    cz2 (nth 2 cerchio2)
+                    r2  (nth 3 cerchio2)
+                    nx2 (nth 4 cerchio2)
+                    ny2 (nth 5 cerchio2)
+                    nz2 (nth 6 cerchio2))
+
+              ; Normalizza il vettore normale del cerchio 2
+              (setq lunghezza-n (sqrt (+ (* nx2 nx2) (* ny2 ny2) (* nz2 nz2))))
+              (if (> lunghezza-n *TOLLERANZA*)
+                (setq nx2 (/ nx2 lunghezza-n)
+                      ny2 (/ ny2 lunghezza-n)
+                      nz2 (/ nz2 lunghezza-n))
+              )
+
+              ; Condizione 1: stesso raggio (tolleranza relativa 0.1% del raggio)
+              (if (< (abs (- r1 r2)) (* (max r1 r2) 0.001))
+                (progn
+                  ; Condizione 2: normali parallele → stesso asse del cilindro
+                  ; (soglia 0.9 ≈ cos(26°): normali entro ~26° sono considerate parallele)
+                  (setq dot-nn (+ (* nx1 nx2) (* ny1 ny2) (* nz1 nz2)))
+                  (if (> (abs dot-nn) 0.9)
+                    (progn
+                      ; Condizione 3: vettore tra centri parallelo alla normale
+                      ; (stessa soglia 0.9 ≈ cos(26°): verifica coassialità)
+                      ; → i due cerchi sono coassiali (stesso foro)
+                      (setq vx (- cx2 cx1)
+                            vy (- cy2 cy1)
+                            vz (- cz2 cz1))
+                      (setq dist-cc (sqrt (+ (* vx vx) (* vy vy) (* vz vz))))
+                      (if (> dist-cc *TOLLERANZA*)
+                        (progn
+                          (setq vx-n (/ vx dist-cc)
+                                vy-n (/ vy dist-cc)
+                                vz-n (/ vz dist-cc))
+                          (setq dot-vn
+                                (abs (+ (* vx-n nx1)
+                                        (* vy-n ny1)
+                                        (* vz-n nz1))))
+                          (if (> dot-vn 0.9)
+                            ; Foro passante: due cerchi coassiali trovati
+                            (progn
+                              (setq cerchio-gemello idx2
+                                    profondita-foro dist-cc)
+                              (setq cerchi-usati
+                                    (append cerchi-usati (list idx2)))
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+          (setq idx2 (1+ idx2))
+        )
+
+        ; Marca il cerchio corrente come elaborato
+        (setq cerchi-usati (append cerchi-usati (list idx1)))
+
+        ; Per fori ciechi (nessun gemello) stima la profondità
+        ; come dimensione del solido lungo l'asse del foro
+        (if (null cerchio-gemello)
+          (cond
+            ((> (abs nz1) 0.9) (setq profondita-foro alt))
+            ((> (abs ny1) 0.9) (setq profondita-foro lar))
+            ((> (abs nx1) 0.9) (setq profondita-foro lun))
+            (t                 (setq profondita-foro 0.0))
+          )
+        )
+
+        ; Identifica la faccia di ingresso del foro tramite la normale
         (setq nome-faccia
-              (identifica-faccia cx cy cz
-                                  x-min y-min z-min
-                                  x-max y-max z-max
-                                  normale-cerchio))
+              (identifica-faccia cx1 cy1 cz1
+                                 x-min y-min z-min
+                                 x-max y-max z-max
+                                 (list nx1 ny1 nz1)))
 
-        ; Calcola posizione locale sulla faccia
+        ; Calcola la posizione locale (2D) sulla faccia
         (setq pos-xy
-              (calcola-posizione-su-faccia cx cy cz nome-faccia
-                                            x-min y-min z-min
-                                            x-max y-max z-max))
+              (calcola-posizione-su-faccia cx1 cy1 cz1 nome-faccia
+                                           x-min y-min z-min
+                                           x-max y-max z-max))
 
-        ; Stima della profondità del foro.
-        ; NOTA: senza accesso diretto alla geometria ACIS, la profondità
-        ; viene stimata come la dimensione massima del solido lungo l'asse
-        ; perpendicolare alla faccia. Questo valore rappresenta la profondità
-        ; massima possibile (foro passante). Per fori ciechi o parziali
-        ; il valore reale sarà inferiore.
-        (cond
-          ((or (equal nome-faccia "Alto") (equal nome-faccia "Basso"))
-           (setq profondita alt))
-          ((or (equal nome-faccia "Fronte") (equal nome-faccia "Retro"))
-           (setq profondita lar))
-          ((or (equal nome-faccia "Sinistra") (equal nome-faccia "Destra"))
-           (setq profondita lun))
-          (t
-           (setq profondita 0.0))
-        )
-
-        ; Aggiunge il foro alla lista
+        ; Aggiunge il foro alla lista risultati
         (setq lista-fori
               (append lista-fori
                       (list (list nome-faccia
                                   (car pos-xy)
                                   (cadr pos-xy)
-                                  diametro
-                                  profondita))))
+                                  (* 2.0 r1)
+                                  profondita-foro))))
       )
     )
+    (setq idx1 (1+ idx1))
   )
+
+  ; --- Fase 5: Cancella TUTTE le entità temporanee ---
+  (foreach ent *ANALISI-FORI-ENTI-TEMP*
+    (if (and ent (not (null (entget ent))))
+      (entdel ent)
+    )
+  )
+  (setq *ANALISI-FORI-ENTI-TEMP* '())
+
+  ; Ripristina il gestore errori originale
+  (setq *error* *ANALISI-FORI-ERR-ORIG*)
 
   lista-fori
 )
