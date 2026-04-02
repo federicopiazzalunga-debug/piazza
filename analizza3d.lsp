@@ -240,10 +240,10 @@
 ;;;
 ;;;   Procedura:
 ;;;   1. Copia il solido (vla-Copy) per non modificare l'originale
-;;;   2. Esplode iterativamente la copia (vla-Explode) fino ad
-;;;      ottenere le curve primitive: solido → facce REGION →
-;;;      curve (CIRCLE, ARC, LINE, ELLIPSE)
-;;;   3. Filtra i CIRCLE tra le entità risultanti
+;;;   2. Esplode la copia con il comando EXPLODE: 3DSOLID → REGION
+;;;      Le nuove entità vengono tracciate con entlast/entnext
+;;;   3. Esplode ogni REGION con il comando EXPLODE: REGION → curve
+;;;      (CIRCLE, ARC, LINE, …); raccoglie i CIRCLE trovati
 ;;;   4. Raggruppa i cerchi coassiali con lo stesso raggio per
 ;;;      identificare i fori unici:
 ;;;      - Foro passante: due cerchi coassiali (profondità reale
@@ -253,17 +253,22 @@
 ;;;   5. Cancella TUTTE le entità temporanee (anche in caso di
 ;;;      errore tramite gestore *error*)
 ;;;
+;;;   NOTA TECNICA: si usa il comando EXPLODE (non vla-Explode) perché
+;;;   vla-Explode restituisce un SafeArray, non una Collection VLA;
+;;;   vlax-for funziona solo sulle Collection e itera 0 volte su un
+;;;   SafeArray senza segnalare errori, rendendo la funzione cieca.
+;;;   Il comando EXPLODE è identico all'uso interattivo e affidabile
+;;;   in tutte le versioni di AutoCAD che supportano i 3D solid.
+;;;
 ;;;   Restituisce una lista di fori, ognuno nella forma:
 ;;;   (faccia pos-x pos-y diametro profondita)
 ;;; ------------------------------------------------------------
 (defun analizza-fori-solido (nome-entita bbox-info
                               / oggetto-vla oggetto-copia entita-copia
-                                coda-esplosione nuova-coda
-                                lista-cerchi-info lista-fori
+                                ent-ante cursore dati-ent tipo-corrente
+                                lista-regioni lista-cerchi-info lista-fori
                                 lun lar alt
                                 x-min y-min z-min x-max y-max z-max
-                                ent-corrente tipo-ent vla-ent
-                                risultato-exp nuovo-ent
                                 dati-c cx cy cz raggio normale-c
                                 idx1 idx2 cerchi-usati
                                 cx1 cy1 cz1 r1 nx1 ny1 nz1
@@ -271,8 +276,7 @@
                                 lunghezza-n dot-nn vx vy vz dist-cc
                                 vx-n vy-n vz-n dot-vn
                                 cerchio-gemello profondita-foro
-                                nome-faccia pos-xy
-                                livello-corrente)
+                                nome-faccia pos-xy)
 
   ; Inizializza le dimensioni del bounding box
   (setq lun   (nth 0 bbox-info)
@@ -287,14 +291,21 @@
 
   (setq lista-fori              '()
         lista-cerchi-info       '()
+        lista-regioni           '()
         *ANALISI-FORI-ENTI-TEMP* '())
 
   ; Installa il gestore errori per garantire la pulizia delle
   ; entità temporanee anche in caso di errore imprevisto.
   ; Le entità temporanee sono salvate nella variabile globale
   ; *ANALISI-FORI-ENTI-TEMP* accessibile dall'handler.
+  ; L'eco comandi è salvato in *ANALISI-FORI-ECO-ORIG*.
   (setq *ANALISI-FORI-ERR-ORIG* *error*)
   (defun *error* (msg)
+    ; Ripristina eco comandi
+    (if (numberp *ANALISI-FORI-ECO-ORIG*)
+      (setvar "CMDECHO" *ANALISI-FORI-ECO-ORIG*)
+    )
+    ; Cancella le entità temporanee ancora presenti nel database
     (foreach ent *ANALISI-FORI-ENTI-TEMP*
       (if (and ent (not (null (entget ent))))
         (entdel ent)
@@ -307,100 +318,98 @@
     )
   )
 
+  ; Silenzia l'eco dei comandi per uso non interattivo
+  (setq *ANALISI-FORI-ECO-ORIG* (getvar "CMDECHO"))
+  (setvar "CMDECHO" 0)
+
   ; --- Fase 1: Copia il solido per non modificare l'originale ---
-  (setq oggetto-vla   (vlax-ename->vla-object nome-entita))
+  ; Si salva l'ultima entità del database PRIMA di creare la copia:
+  ; questo punto di ancoraggio consente di trovare le nuove entità
+  ; create dai successivi comandi EXPLODE tramite entnext.
+  (setq ent-ante    (entlast)
+        oggetto-vla (vlax-ename->vla-object nome-entita))
   (setq oggetto-copia (vla-Copy oggetto-vla))
   (setq entita-copia  (vlax-vla-object->ename oggetto-copia))
+  ; La copia è registrata per il cleanup nel caso in cui EXPLODE
+  ; fallisca e l'entità rimanga nel database.
   (setq *ANALISI-FORI-ENTI-TEMP* (list entita-copia))
 
-  ; --- Fase 2: Esplosione iterativa per estrarre le curve primitive ---
-  ; Strategia a livelli: ogni iterazione del while processa un
-  ; livello di esplosione. Le entità non esplodibili (curve
-  ; primitive) rimangono in *ANALISI-FORI-ENTI-TEMP* per essere
-  ; analizzate nella fase successiva.
-  ; Il solido si decompone in: 3DSOLID → REGION (facce) → curve
-  (setq coda-esplosione (list entita-copia)
-        livello-corrente 0)
+  ; --- Fase 2: Prima esplosione: 3DSOLID → REGION ---
+  ; Il comando EXPLODE decompone il solido nelle sue facce come
+  ; entità REGION (una per ogni faccia planare/cilindrica).
+  ; Il comando cancella l'entità originale (copia) e crea le REGION.
+  (command "_.EXPLODE" entita-copia "")
 
-  (while (and coda-esplosione (< livello-corrente 5)) ; max 5 livelli: 3DSOLID→REGION→curve (5 è abbondante)
-    (setq nuova-coda '())
-
-    (foreach ent-corrente coda-esplosione
-      (if (and ent-corrente (entget ent-corrente))
-        (progn
-          (setq tipo-ent (cdr (assoc 0 (entget ent-corrente))))
-
-          ; Solo le entità composte vengono esplose ulteriormente;
-          ; le curve primitive restano invariate in *ANALISI-FORI-ENTI-TEMP*
-          (if (wcmatch tipo-ent "3DSOLID,REGION,SURFACE,BODY")
-            (progn
-              (setq vla-ent (vlax-ename->vla-object ent-corrente))
-              (if vla-ent
-                (progn
-                  ; Tentativo di esplosione con cattura degli errori
-                  (setq risultato-exp
-                        (vl-catch-all-apply 'vla-Explode (list vla-ent)))
-                  ; vla-Explode NON cancella l'originale:
-                  ; ent-corrente è già in *ANALISI-FORI-ENTI-TEMP*
-                  (if (not (vl-catch-all-error-p risultato-exp))
-                    ; Esplosione riuscita: aggiungi le nuove entità
-                    ; alla coda per il prossimo livello di esplosione
-                    (if risultato-exp
-                      (vlax-for nuovo-obj risultato-exp
-                        (setq nuovo-ent (vlax-vla-object->ename nuovo-obj))
-                        (if nuovo-ent
-                          (progn
-                            (setq nuova-coda
-                                  (append nuova-coda (list nuovo-ent)))
-                            (setq *ANALISI-FORI-ENTI-TEMP*
-                                  (append *ANALISI-FORI-ENTI-TEMP*
-                                          (list nuovo-ent)))
-                          )
-                        )
-                      )
-                    )
-                  )
-                )
-              )
-            )
-          )
-        )
-      )
-    )
-
-    (setq coda-esplosione nuova-coda
-          livello-corrente (1+ livello-corrente))
-  )
-
-  ; --- Fase 3: Raccoglie i cerchi tra tutte le entità temporanee ---
-  ; I cerchi rappresentano i bordi circolari dei fori nel solido
-  (foreach ent *ANALISI-FORI-ENTI-TEMP*
-    (if (and ent (entget ent))
+  ; Raccoglie le REGION create dall'esplosione.
+  ; entnext avanza dal punto di ancoraggio (ent-ante) in poi;
+  ; poiché entita-copia è stata cancellata dal comando EXPLODE,
+  ; entnext la salta e restituisce direttamente le nuove REGION.
+  ; Il controllo (entget cursore) garantisce di ignorare eventuali
+  ; entità cancellate che entnext potrebbe comunque attraversare.
+  (setq cursore ent-ante)
+  (while (setq cursore (entnext cursore))
+    (setq dati-ent (entget cursore))
+    (if dati-ent
       (progn
-        (setq tipo-ent (cdr (assoc 0 (entget ent))))
-        (if (equal tipo-ent "CIRCLE")
-          (progn
-            (setq dati-c   (entget ent)
-                  cx       (car   (cdr (assoc 10 dati-c)))
-                  cy       (cadr  (cdr (assoc 10 dati-c)))
-                  cz       (caddr (cdr (assoc 10 dati-c)))
-                  raggio   (cdr (assoc 40 dati-c))
-                  normale-c (cdr (assoc 210 dati-c)))
-            (if (null normale-c)
-              (setq normale-c '(0.0 0.0 1.0))
+        (setq tipo-corrente (cdr (assoc 0 dati-ent)))
+        ; Tutte le nuove entità vengono registrate per il cleanup
+        (setq *ANALISI-FORI-ENTI-TEMP*
+              (append *ANALISI-FORI-ENTI-TEMP* (list cursore)))
+        ; Le entità composte (facce) vengono messe in lista per
+        ; la successiva esplosione in curve primitive
+        (if (wcmatch tipo-corrente "REGION,SURFACE,BODY,3DSOLID")
+          (setq lista-regioni (append lista-regioni (list cursore)))
+        )
+      )
+    )
+  )
+
+  ; --- Fase 3: Seconda esplosione: REGION → curve primitive ---
+  ; Ogni faccia REGION viene esplosa per ottenere i bordi geometrici:
+  ; bordi circolari (CIRCLE) = fori, bordi rettilinei (LINE) = spigoli.
+  ; Si usa nuovamente il pattern entlast/entnext: prima di ogni
+  ; esplosione si registra l'ultima entità, poi si raccolgono tutte
+  ; quelle create subito dopo.
+  (foreach reg lista-regioni
+    (setq ent-ante (entlast))
+    (command "_.EXPLODE" reg "")
+    (setq cursore ent-ante)
+    (while (setq cursore (entnext cursore))
+      (setq dati-ent (entget cursore))
+      (if dati-ent
+        (progn
+          (setq tipo-corrente (cdr (assoc 0 dati-ent)))
+          ; Registra per il cleanup
+          (setq *ANALISI-FORI-ENTI-TEMP*
+                (append *ANALISI-FORI-ENTI-TEMP* (list cursore)))
+          ; I CIRCLE rappresentano i bordi circolari dei fori
+          (if (equal tipo-corrente "CIRCLE")
+            (progn
+              (setq dati-c    dati-ent
+                    cx        (car   (cdr (assoc 10 dati-c)))
+                    cy        (cadr  (cdr (assoc 10 dati-c)))
+                    cz        (caddr (cdr (assoc 10 dati-c)))
+                    raggio    (cdr (assoc 40 dati-c))
+                    normale-c (cdr (assoc 210 dati-c)))
+              (if (null normale-c)
+                (setq normale-c '(0.0 0.0 1.0))
+              )
+              ; Salva: (cx cy cz raggio nx ny nz)
+              (setq lista-cerchi-info
+                    (append lista-cerchi-info
+                            (list (list cx cy cz raggio
+                                        (car normale-c)
+                                        (cadr normale-c)
+                                        (caddr normale-c)))))
             )
-            ; Salva: (cx cy cz raggio nx ny nz)
-            (setq lista-cerchi-info
-                  (append lista-cerchi-info
-                          (list (list cx cy cz raggio
-                                      (car normale-c)
-                                      (cadr normale-c)
-                                      (caddr normale-c)))))
           )
         )
       )
     )
   )
+
+  ; Ripristina eco comandi ora che le esplosioni sono terminate
+  (setvar "CMDECHO" *ANALISI-FORI-ECO-ORIG*)
 
   ; --- Fase 4: Raggruppa i cerchi per identificare i fori ---
   ; Un foro è identificato da cerchi coassiali con lo stesso raggio:
