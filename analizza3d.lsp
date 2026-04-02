@@ -93,7 +93,6 @@
   (cond
     ; Faccia superiore (normale verso +Z)
     ((and normale
-          (> (abs (- (caddr normale) 1.0)) -1)
           (> (caddr normale) 0.5))
      (setq nome-faccia "Alto"))
 
@@ -199,6 +198,39 @@
 )
 
 ;;; ------------------------------------------------------------
+;;; Funzione: formatta-data
+;;;   Restituisce la data e ora corrente come stringa leggibile
+;;;   nel formato DD/MM/YYYY HH:MM:SS.
+;;; ------------------------------------------------------------
+(defun formatta-data (/ cdate-val parte-int parte-dec
+                         anno mese giorno
+                         ore minuti secondi tempo-val)
+  ; getvar "CDATE" restituisce YYYYMMDD.HHMMSSmmm come numero reale
+  (setq cdate-val (getvar "CDATE")
+        parte-int (fix cdate-val)
+        parte-dec (- cdate-val parte-int))
+
+  ; Estrai anno, mese, giorno dalla parte intera (YYYYMMDD)
+  (setq anno   (fix (/ parte-int 10000))
+        mese   (fix (/ (rem parte-int 10000) 100))
+        giorno (rem parte-int 100))
+
+  ; Estrai ore, minuti, secondi dalla parte decimale (HHMMSSmmm -> HH.MM.SS)
+  (setq tempo-val (* parte-dec 1000000.0))
+  (setq ore     (fix (/ tempo-val 10000.0))
+        minuti  (fix (/ (rem (fix tempo-val) 10000) 100))
+        secondi (rem (fix tempo-val) 100))
+
+  ; Formatta come DD/MM/YYYY HH:MM:SS
+  (strcat (if (< giorno 10) (strcat "0" (itoa giorno)) (itoa giorno)) "/"
+          (if (< mese   10) (strcat "0" (itoa mese))   (itoa mese))   "/"
+          (itoa anno) " "
+          (if (< ore     10) (strcat "0" (itoa ore))     (itoa ore))     ":"
+          (if (< minuti  10) (strcat "0" (itoa minuti))  (itoa minuti))  ":"
+          (if (< secondi 10) (strcat "0" (itoa secondi)) (itoa secondi)))
+)
+
+;;; ------------------------------------------------------------
 ;;; Funzione: analizza-fori-solido
 ;;;   Analizza le sotto-entità di un solido 3D per trovare i
 ;;;   fori cilindrici.
@@ -207,7 +239,7 @@
 ;;; ------------------------------------------------------------
 (defun analizza-fori-solido (nome-entita bbox-info
                               / entita-dati tipo-entita
-                                indice-sottoentita sotto-entita
+                                ultima-entita sotto-entita
                                 dati-sottoentita
                                 lista-fori lista-cerchi
                                 cx cy cz raggio diametro
@@ -227,27 +259,16 @@
         z-max  (nth 8 bbox-info))
 
   (setq lista-fori   '()
-        lista-cerchi '()
-        indice-sottoentita 0)
+        lista-cerchi '())
 
-  ; Scansiona le sotto-entità del solido cercando cerchi (fori)
+  ; Scansiona le sotto-entità del solido cercando cerchi (fori).
   ; Le sotto-entità di un 3DSOLID con ACIS includono le facce,
   ; i bordi e i vertici. I fori cilindrici appaiono come bordi
   ; circolari (cerchi) sulle facce.
-  (while
-    (setq sotto-entita
-          (entnext
-            (if (= indice-sottoentita 0)
-              nome-entita
-              (progn
-                ; Ottieni l'ultima sotto-entità trovata
-                (if lista-cerchi
-                  (car (last lista-cerchi))
-                  nome-entita)
-              )
-            )
-          ))
-
+  ; Si usa entnext in modo corretto: ogni iterazione riceve
+  ; l'ultima entità processata per ottenere la successiva.
+  (setq ultima-entita nome-entita)
+  (while (setq sotto-entita (entnext ultima-entita))
     ; Verifica se la sotto-entità è un cerchio
     (setq dati-sottoentita (entget sotto-entita))
     (setq tipo-entita (cdr (assoc 0 dati-sottoentita)))
@@ -256,9 +277,8 @@
       (setq lista-cerchi (append lista-cerchi (list sotto-entita)))
     )
 
-    (setq indice-sottoentita (1+ indice-sottoentita))
-    ; Aggiorna per proseguire la scansione
-    (setq nome-entita sotto-entita)
+    ; Avanza alla sotto-entità successiva
+    (setq ultima-entita sotto-entita)
   )
 
   ; Per ogni cerchio trovato, crea un record foro
@@ -295,11 +315,12 @@
                                             x-min y-min z-min
                                             x-max y-max z-max))
 
-        ; Stima della profondità del foro
-        ; La profondità è calcolata in base alla direzione normale:
-        ; - Su "Alto"/"Basso": profondità lungo Z
-        ; - Su "Fronte"/"Retro": profondità lungo Y
-        ; - Su "Sinistra"/"Destra": profondità lungo X
+        ; Stima della profondità del foro.
+        ; NOTA: senza accesso diretto alla geometria ACIS, la profondità
+        ; viene stimata come la dimensione massima del solido lungo l'asse
+        ; perpendicolare alla faccia. Questo valore rappresenta la profondità
+        ; massima possibile (foro passante). Per fori ciechi o parziali
+        ; il valore reale sarà inferiore.
         (cond
           ((or (equal nome-faccia "Alto") (equal nome-faccia "Basso"))
            (setq profondita alt))
@@ -342,69 +363,71 @@
   (setq fh (open percorso "w"))
 
   (if (null fh)
+    ; Impossibile aprire il file: notifica l'utente e termina la funzione
     (progn
       (alert (strcat "ERRORE: impossibile aprire il file di output:\n"
                      percorso
                      "\nVerificare che la cartella esista."))
-      (exit)
     )
-  )
+    ; File aperto con successo: scrivi il report
+    (progn
+      ; Intestazione del file
+      (write-line "=== ANALISI PEZZI 3D ===" fh)
+      (write-line (strcat "Data/ora analisi: " (formatta-data)) fh)
+      (write-line (strcat "Numero pezzi analizzati: " (itoa (length lista-risultati))) fh)
+      (write-line "" fh)
 
-  ; Intestazione del file
-  (write-line "=== ANALISI PEZZI 3D ===" fh)
-  (write-line (strcat "Data/ora analisi: " (menucmd "M=$(edtime,$(getvar,DATE),DD/MM/YYYY HH:MM:SS)")) fh)
-  (write-line (strcat "Numero pezzi analizzati: " (itoa (length lista-risultati))) fh)
-  (write-line "" fh)
+      ; Scrivi i dati per ogni pezzo
+      (setq numero-pezzo 0)
+      (foreach risultato lista-risultati
+        (setq numero-pezzo  (1+ numero-pezzo)
+              nome-id       (nth 0 risultato)
+              bbox-info     (nth 1 risultato)
+              lista-fori    (nth 2 risultato))
 
-  ; Scrivi i dati per ogni pezzo
-  (setq numero-pezzo 0)
-  (foreach risultato lista-risultati
-    (setq numero-pezzo  (1+ numero-pezzo)
-          nome-id       (nth 0 risultato)
-          bbox-info     (nth 1 risultato)
-          lista-fori    (nth 2 risultato))
+        (setq lun (arrotonda (nth 0 bbox-info) 3)
+              lar (arrotonda (nth 1 bbox-info) 3)
+              alt (arrotonda (nth 2 bbox-info) 3))
 
-    (setq lun (arrotonda (nth 0 bbox-info) 3)
-          lar (arrotonda (nth 1 bbox-info) 3)
-          alt (arrotonda (nth 2 bbox-info) 3))
+        (write-line (strcat "========================================") fh)
+        (write-line (strcat "Pezzo " (itoa numero-pezzo) ": " nome-id) fh)
+        (write-line (strcat "Dimensioni: L=" (rtos lun 2 3)
+                                      " W=" (rtos lar 2 3)
+                                      " H=" (rtos alt 2 3)) fh)
+        (write-line "" fh)
 
-    (write-line (strcat "========================================") fh)
-    (write-line (strcat "Pezzo " (itoa numero-pezzo) ": " nome-id) fh)
-    (write-line (strcat "Dimensioni: L=" (rtos lun 2 3)
-                                  " W=" (rtos lar 2 3)
-                                  " H=" (rtos alt 2 3)) fh)
-    (write-line "" fh)
+        (if (null lista-fori)
+          (write-line "  Nessun foro rilevato." fh)
+          (progn
+            (write-line "--- FORI RILEVATI ---" fh)
+            (setq numero-foro 0)
+            (foreach foro lista-fori
+              (setq numero-foro (1+ numero-foro)
+                    faccia      (nth 0 foro)
+                    px          (arrotonda (nth 1 foro) 3)
+                    py          (arrotonda (nth 2 foro) 3)
+                    diametro    (arrotonda (nth 3 foro) 3)
+                    prof        (arrotonda (nth 4 foro) 3))
 
-    (if (null lista-fori)
-      (write-line "  Nessun foro rilevato." fh)
-      (progn
-        (write-line "--- FORI RILEVATI ---" fh)
-        (setq numero-foro 0)
-        (foreach foro lista-fori
-          (setq numero-foro (1+ numero-foro)
-                faccia      (nth 0 foro)
-                px          (arrotonda (nth 1 foro) 3)
-                py          (arrotonda (nth 2 foro) 3)
-                diametro    (arrotonda (nth 3 foro) 3)
-                prof        (arrotonda (nth 4 foro) 3))
-
-          (write-line (strcat "Foro " (itoa numero-foro) ":") fh)
-          (write-line (strcat "  Faccia: "      faccia) fh)
-          (write-line (strcat "  Posizione X: " (rtos px 2 3)) fh)
-          (write-line (strcat "  Posizione Y: " (rtos py 2 3)) fh)
-          (write-line (strcat "  Diametro: "    (rtos diametro 2 3)) fh)
-          (write-line (strcat "  Profondita: "  (rtos prof 2 3)) fh)
-          (write-line "" fh)
+              (write-line (strcat "Foro " (itoa numero-foro) ":") fh)
+              (write-line (strcat "  Faccia: "      faccia) fh)
+              (write-line (strcat "  Posizione X: " (rtos px 2 3)) fh)
+              (write-line (strcat "  Posizione Y: " (rtos py 2 3)) fh)
+              (write-line (strcat "  Diametro: "    (rtos diametro 2 3)) fh)
+              (write-line (strcat "  Profondità: "  (rtos prof 2 3)) fh)
+              (write-line "" fh)
+            )
+          )
         )
+        (write-line "" fh)
       )
+
+      (write-line "=== FINE REPORT ===" fh)
+      (close fh)
+
+      (princ (strcat "\nReport salvato in: " percorso))
     )
-    (write-line "" fh)
   )
-
-  (write-line "=== FINE REPORT ===" fh)
-  (close fh)
-
-  (princ (strcat "\nReport salvato in: " percorso))
 )
 
 ;;; ------------------------------------------------------------
@@ -426,64 +449,65 @@
   (if (null selezione)
     (progn
       (princ "\nNessun solido 3D selezionato. Operazione annullata.")
-      (exit)
+      (princ)
     )
-  )
+    (progn
+      (setq numero-entita    (sslength selezione)
+            lista-risultati  '()
+            contatore-solidi 0)
 
-  (setq numero-entita    (sslength selezione)
-        lista-risultati  '()
-        contatore-solidi 0)
+      (princ (strcat "\n" (itoa numero-entita) " solido/i selezionato/i. Analisi in corso..."))
 
-  (princ (strcat "\n" (itoa numero-entita) " solido/i selezionato/i. Analisi in corso..."))
+      ; Ciclo su ogni entità selezionata
+      (setq i 0)
+      (while (< i numero-entita)
+        (setq nome-entita  (ssname selezione i)
+              entita-dati  (entget nome-entita)
+              tipo-entita  (cdr (assoc 0 entita-dati)))
 
-  ; Ciclo su ogni entità selezionata
-  (setq i 0)
-  (while (< i numero-entita)
-    (setq nome-entita  (ssname selezione i)
-          entita-dati  (entget nome-entita)
-          tipo-entita  (cdr (assoc 0 entita-dati)))
+        ; Verifica che sia un 3DSOLID
+        (if (equal tipo-entita "3DSOLID")
+          (progn
+            (setq contatore-solidi (1+ contatore-solidi))
 
-    ; Verifica che sia un 3DSOLID
-    (if (equal tipo-entita "3DSOLID")
-      (progn
-        (setq contatore-solidi (1+ contatore-solidi))
+            ; ID del pezzo: usa il nome handle AutoCAD
+            (setq nome-id (strcat "Solido_" (cdr (assoc 5 entita-dati))))
 
-        ; ID del pezzo: usa il nome handle AutoCAD
-        (setq nome-id (strcat "Solido_" (cdr (assoc 5 entita-dati))))
+            (princ (strcat "\n  Analisi " nome-id " ..."))
 
-        (princ (strcat "\n  Analisi " nome-id " ..."))
+            ; Ottieni il bounding box tramite VLA
+            (setq oggetto-vla (vlax-ename->vla-object nome-entita))
+            (setq bbox-info   (ottieni-dimensioni-bbox oggetto-vla))
 
-        ; Ottieni il bounding box tramite VLA
-        (setq oggetto-vla (vlax-ename->vla-object nome-entita))
-        (setq bbox-info   (ottieni-dimensioni-bbox oggetto-vla))
+            ; Analizza i fori del solido
+            (setq lista-fori (analizza-fori-solido nome-entita bbox-info))
 
-        ; Analizza i fori del solido
-        (setq lista-fori (analizza-fori-solido nome-entita bbox-info))
+            (princ (strcat " OK ("
+                           (itoa (length lista-fori))
+                           " foro/i rilevato/i)"))
 
-        (princ (strcat " OK ("
-                       (itoa (length lista-fori))
-                       " foro/i rilevato/i)"))
+            ; Aggiungi i risultati alla lista generale
+            (setq lista-risultati
+                  (append lista-risultati
+                          (list (list nome-id bbox-info lista-fori))))
+          )
+        )
 
-        ; Aggiungi i risultati alla lista generale
-        (setq lista-risultati
-              (append lista-risultati
-                      (list (list nome-id bbox-info lista-fori))))
+        (setq i (1+ i))
       )
+
+      ; Scrivi il report
+      (princ (strcat "\n\nAnalisi completata: "
+                     (itoa contatore-solidi)
+                     " solido/i elaborato/i."))
+      (princ "\nGenerazione del report...")
+
+      (scrivi-report lista-risultati)
+
+      (princ "\nOperazione completata con successo.")
+      (princ)
     )
-
-    (setq i (1+ i))
   )
-
-  ; Scrivi il report
-  (princ (strcat "\n\nAnalisi completata: "
-                 (itoa contatore-solidi)
-                 " solido/i elaborato/i."))
-  (princ "\nGenerazione del report...")
-
-  (scrivi-report lista-risultati)
-
-  (princ "\nOperazione completata con successo.")
-  (princ)
 )
 
 ;;; ------------------------------------------------------------
